@@ -6,6 +6,7 @@ namespace remote_base {
 
 static const char *const TAG = "remote.rc_switch";
 
+/* Temporary lock to single protocol
 const RCSwitchBase RC_SWITCH_PROTOCOLS[9] = {RCSwitchBase(0, 0, 0, 0, 0, 0, false),
                                              RCSwitchBase(350, 10850, 350, 1050, 1050, 350, false),
                                              RCSwitchBase(650, 6500, 650, 1300, 1300, 650, false),
@@ -15,6 +16,11 @@ const RCSwitchBase RC_SWITCH_PROTOCOLS[9] = {RCSwitchBase(0, 0, 0, 0, 0, 0, fals
                                              RCSwitchBase(10350, 450, 450, 900, 900, 450, true),
                                              RCSwitchBase(300, 9300, 150, 900, 900, 150, false),
                                              RCSwitchBase(250, 2500, 250, 1250, 250, 250, false)};
+*/
+
+const RCSwitchBase RC_SWITCH_PROTOCOLS[2] = {RCSwitchBase(0, 0, 0, 0, 0, 0, false),
+                                             RCSwitchBase(270, 2600, 270, 1350, 270, 270, false)};
+
 
 RCSwitchBase::RCSwitchBase(uint32_t sync_high, uint32_t sync_low, uint32_t zero_high, uint32_t zero_low,
                            uint32_t one_high, uint32_t one_low, bool inverted)
