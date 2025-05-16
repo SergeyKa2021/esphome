@@ -1,4 +1,39 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from enum import IntEnum
+import os
+from pathlib import Path
+import re
+from subprocess import call
+import sys
+from textwrap import dedent
+from typing import Any
+
+import aioesphomeapi.api_options_pb2 as pb
+import google.protobuf.descriptor_pb2 as descriptor
+
+
+class WireType(IntEnum):
+    """Protocol Buffer wire types as defined in the protobuf spec.
+
+    As specified in the Protocol Buffers encoding guide:
+    https://protobuf.dev/programming-guides/encoding/#structure
+    """
+
+    VARINT = 0  # int32, int64, uint32, uint64, sint32, sint64, bool, enum
+    FIXED64 = 1  # fixed64, sfixed64, double
+    LENGTH_DELIMITED = 2  # string, bytes, embedded messages, packed repeated fields
+    START_GROUP = 3  # groups (deprecated)
+    END_GROUP = 4  # groups (deprecated)
+    FIXED32 = 5  # fixed32, sfixed32, float
+
+
+# Generate with
+# protoc --python_out=script/api_protobuf -I esphome/components/api/ api_options.proto
+
+
 """Python 3 script to automatically generate C++ classes for ESPHome's native API.
 
 It's pretty crappy spaghetti code, but it works.
@@ -17,31 +52,14 @@ then run this script with python3 and the files
 will be generated, they still need to be formatted
 """
 
-import re
-import os
-from pathlib import Path
-from textwrap import dedent
-from subprocess import call
 
-# Generate with
-# protoc --python_out=script/api_protobuf -I esphome/components/api/ api_options.proto
-
-import aioesphomeapi.api_options_pb2 as pb
-import google.protobuf.descriptor_pb2 as descriptor
-
-file_header = "// This file was automatically generated with a tool.\n"
-file_header += "// See scripts/api_protobuf/api_protobuf.py\n"
-
-cwd = Path(__file__).resolve().parent
-root = cwd.parent.parent / "esphome" / "components" / "api"
-prot = root / "api.protoc"
-call(["protoc", "-o", str(prot), "-I", str(root), "api.proto"])
-content = prot.read_bytes()
-
-d = descriptor.FileDescriptorSet.FromString(content)
+FILE_HEADER = """// This file was automatically generated with a tool.
+// See script/api_protobuf/api_protobuf.py
+"""
 
 
-def indent_list(text, padding="  "):
+def indent_list(text: str, padding: str = "  ") -> list[str]:
+    """Indent each line of the given text with the specified padding."""
     lines = []
     for line in text.splitlines():
         if line == "":
@@ -54,54 +72,72 @@ def indent_list(text, padding="  "):
     return lines
 
 
-def indent(text, padding="  "):
+def indent(text: str, padding: str = "  ") -> str:
     return "\n".join(indent_list(text, padding))
 
 
-def camel_to_snake(name):
+def camel_to_snake(name: str) -> str:
     # https://stackoverflow.com/a/1176023
     s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
     return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
 
-class TypeInfo:
-    def __init__(self, field):
+def force_str(force: bool) -> str:
+    """Convert a boolean force value to string format for C++ code."""
+    return str(force).lower()
+
+
+class TypeInfo(ABC):
+    """Base class for all type information."""
+
+    def __init__(self, field: descriptor.FieldDescriptorProto) -> None:
         self._field = field
 
     @property
-    def default_value(self):
+    def default_value(self) -> str:
+        """Get the default value."""
         return ""
 
     @property
-    def name(self):
+    def name(self) -> str:
+        """Get the name of the field."""
         return self._field.name
 
     @property
-    def arg_name(self):
+    def arg_name(self) -> str:
+        """Get the argument name."""
         return self.name
 
     @property
-    def field_name(self):
+    def field_name(self) -> str:
+        """Get the field name."""
         return self.name
 
     @property
-    def number(self):
+    def number(self) -> int:
+        """Get the field number."""
         return self._field.number
 
     @property
-    def repeated(self):
+    def repeated(self) -> bool:
+        """Check if the field is repeated."""
         return self._field.label == 3
 
     @property
-    def cpp_type(self):
+    def wire_type(self) -> WireType:
+        """Get the wire type for the field."""
         raise NotImplementedError
 
     @property
-    def reference_type(self):
+    def cpp_type(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def reference_type(self) -> str:
         return f"{self.cpp_type} "
 
     @property
-    def const_reference_type(self):
+    def const_reference_type(self) -> str:
         return f"{self.cpp_type} "
 
     @property
@@ -177,26 +213,60 @@ class TypeInfo:
     decode_64bit = None
 
     @property
-    def encode_content(self):
+    def encode_content(self) -> str:
         return f"buffer.{self.encode_func}({self.number}, this->{self.field_name});"
 
     encode_func = None
 
     @property
-    def dump_content(self):
+    def dump_content(self) -> str:
         o = f'out.append("  {self.name}: ");\n'
         o += self.dump(f"this->{self.field_name}") + "\n"
-        o += f'out.append("\\n");\n'
+        o += 'out.append("\\n");\n'
         return o
 
-    dump = None
+    @abstractmethod
+    def dump(self, name: str) -> str:
+        """Dump the value to the output."""
+
+    def calculate_field_id_size(self) -> int:
+        """Calculates the size of a field ID in bytes.
+
+        Returns:
+            The number of bytes needed to encode the field ID
+        """
+        # Calculate the tag by combining field_id and wire_type
+        tag = (self.number << 3) | (self.wire_type & 0b111)
+
+        # Calculate the varint size
+        if tag < 128:
+            return 1  # 7 bits
+        if tag < 16384:
+            return 2  # 14 bits
+        if tag < 2097152:
+            return 3  # 21 bits
+        if tag < 268435456:
+            return 4  # 28 bits
+        return 5  # 32 bits (maximum for uint32_t)
+
+    @abstractmethod
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        """Calculate the size needed for encoding this field.
+
+        Args:
+            name: The name of the field
+            force: Whether to force encoding the field even if it has a default value
+        """
 
 
-TYPE_INFO = {}
+TYPE_INFO: dict[int, TypeInfo] = {}
 
 
-def register_type(name):
-    def func(value):
+def register_type(name: int):
+    """Decorator to register a type with a name and number."""
+
+    def func(value: TypeInfo) -> TypeInfo:
+        """Register the type with the given name and number."""
         TYPE_INFO[name] = value
         return value
 
@@ -209,10 +279,16 @@ class DoubleType(TypeInfo):
     default_value = "0.0"
     decode_64bit = "value.as_double()"
     encode_func = "encode_double"
+    wire_type = WireType.FIXED64  # Uses wire type 1 according to protobuf spec
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%g", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<8>(total_size, {field_id_size}, {name} != 0.0, {force_str(force)});"
         return o
 
 
@@ -222,10 +298,16 @@ class FloatType(TypeInfo):
     default_value = "0.0f"
     decode_32bit = "value.as_float()"
     encode_func = "encode_float"
+    wire_type = WireType.FIXED32  # Uses wire type 5
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%g", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<4>(total_size, {field_id_size}, {name} != 0.0f, {force_str(force)});"
         return o
 
 
@@ -235,10 +317,16 @@ class Int64Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_int64()"
     encode_func = "encode_int64"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%lld", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_int64_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -248,10 +336,16 @@ class UInt64Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_uint64()"
     encode_func = "encode_uint64"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%llu", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_uint64_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -261,10 +355,16 @@ class Int32Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_int32()"
     encode_func = "encode_int32"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%" PRId32, {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_int32_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -274,10 +374,16 @@ class Fixed64Type(TypeInfo):
     default_value = "0"
     decode_64bit = "value.as_fixed64()"
     encode_func = "encode_fixed64"
+    wire_type = WireType.FIXED64  # Uses wire type 1
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%llu", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<8>(total_size, {field_id_size}, {name} != 0, {force_str(force)});"
         return o
 
 
@@ -287,10 +393,16 @@ class Fixed32Type(TypeInfo):
     default_value = "0"
     decode_32bit = "value.as_fixed32()"
     encode_func = "encode_fixed32"
+    wire_type = WireType.FIXED32  # Uses wire type 5
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%" PRIu32, {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<4>(total_size, {field_id_size}, {name} != 0, {force_str(force)});"
         return o
 
 
@@ -300,9 +412,15 @@ class BoolType(TypeInfo):
     default_value = "false"
     decode_varint = "value.as_bool()"
     encode_func = "encode_bool"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f"out.append(YESNO({name}));"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_bool_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -314,38 +432,50 @@ class StringType(TypeInfo):
     const_reference_type = "const std::string &"
     decode_length = "value.as_string()"
     encode_func = "encode_string"
+    wire_type = WireType.LENGTH_DELIMITED  # Uses wire type 2
 
     def dump(self, name):
         o = f'out.append("\'").append({name}).append("\'");'
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_string_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
 @register_type(11)
 class MessageType(TypeInfo):
     @property
-    def cpp_type(self):
+    def cpp_type(self) -> str:
         return self._field.type_name[1:]
 
     default_value = ""
+    wire_type = WireType.LENGTH_DELIMITED  # Uses wire type 2
 
     @property
-    def reference_type(self):
+    def reference_type(self) -> str:
         return f"{self.cpp_type} &"
 
     @property
-    def const_reference_type(self):
+    def const_reference_type(self) -> str:
         return f"const {self.cpp_type} &"
 
     @property
-    def encode_func(self):
+    def encode_func(self) -> str:
         return f"encode_message<{self.cpp_type}>"
 
     @property
-    def decode_length(self):
+    def decode_length(self) -> str:
         return f"value.as_message<{self.cpp_type}>()"
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f"{name}.dump_to(out);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_message_object(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -357,9 +487,15 @@ class BytesType(TypeInfo):
     const_reference_type = "const std::string &"
     decode_length = "value.as_string()"
     encode_func = "encode_string"
+    wire_type = WireType.LENGTH_DELIMITED  # Uses wire type 2
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'out.append("\'").append({name}).append("\'");'
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_string_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -369,31 +505,43 @@ class UInt32Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_uint32()"
     encode_func = "encode_uint32"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%" PRIu32, {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_uint32_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
 @register_type(14)
 class EnumType(TypeInfo):
     @property
-    def cpp_type(self):
+    def cpp_type(self) -> str:
         return f"enums::{self._field.type_name[1:]}"
 
     @property
-    def decode_varint(self):
+    def decode_varint(self) -> str:
         return f"value.as_enum<{self.cpp_type}>()"
 
     default_value = ""
+    wire_type = WireType.VARINT  # Uses wire type 0
 
     @property
-    def encode_func(self):
+    def encode_func(self) -> str:
         return f"encode_enum<{self.cpp_type}>"
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f"out.append(proto_enum_to_string<{self.cpp_type}>({name}));"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_enum_field(total_size, {field_id_size}, static_cast<uint32_t>({name}), {force_str(force)});"
         return o
 
 
@@ -403,10 +551,16 @@ class SFixed32Type(TypeInfo):
     default_value = "0"
     decode_32bit = "value.as_sfixed32()"
     encode_func = "encode_sfixed32"
+    wire_type = WireType.FIXED32  # Uses wire type 5
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%" PRId32, {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<4>(total_size, {field_id_size}, {name} != 0, {force_str(force)});"
         return o
 
 
@@ -416,10 +570,16 @@ class SFixed64Type(TypeInfo):
     default_value = "0"
     decode_64bit = "value.as_sfixed64()"
     encode_func = "encode_sfixed64"
+    wire_type = WireType.FIXED64  # Uses wire type 1
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%lld", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_fixed_field<8>(total_size, {field_id_size}, {name} != 0, {force_str(force)});"
         return o
 
 
@@ -429,10 +589,16 @@ class SInt32Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_sint32()"
     encode_func = "encode_sint32"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%" PRId32, {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_sint32_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
@@ -442,29 +608,43 @@ class SInt64Type(TypeInfo):
     default_value = "0"
     decode_varint = "value.as_sint64()"
     encode_func = "encode_sint64"
+    wire_type = WireType.VARINT  # Uses wire type 0
 
-    def dump(self, name):
+    def dump(self, name: str) -> str:
         o = f'sprintf(buffer, "%lld", {name});\n'
-        o += f"out.append(buffer);"
+        o += "out.append(buffer);"
+        return o
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        field_id_size = self.calculate_field_id_size()
+        o = f"ProtoSize::add_sint64_field(total_size, {field_id_size}, {name}, {force_str(force)});"
         return o
 
 
 class RepeatedTypeInfo(TypeInfo):
-    def __init__(self, field):
+    def __init__(self, field: descriptor.FieldDescriptorProto) -> None:
         super().__init__(field)
-        self._ti = TYPE_INFO[field.type](field)
+        self._ti: TypeInfo = TYPE_INFO[field.type](field)
 
     @property
-    def cpp_type(self):
+    def cpp_type(self) -> str:
         return f"std::vector<{self._ti.cpp_type}>"
 
     @property
-    def reference_type(self):
+    def reference_type(self) -> str:
         return f"{self.cpp_type} &"
 
     @property
-    def const_reference_type(self):
+    def const_reference_type(self) -> str:
         return f"const {self.cpp_type} &"
+
+    @property
+    def wire_type(self) -> WireType:
+        """Get the wire type for this repeated field.
+
+        For repeated fields, we use the same wire type as the underlying field.
+        """
+        return self._ti.wire_type
 
     @property
     def decode_varint_content(self) -> str:
@@ -519,58 +699,79 @@ class RepeatedTypeInfo(TypeInfo):
         )
 
     @property
-    def _ti_is_bool(self):
+    def _ti_is_bool(self) -> bool:
         # std::vector is specialized for bool, reference does not work
         return isinstance(self._ti, BoolType)
 
     @property
-    def encode_content(self):
+    def encode_content(self) -> str:
         o = f"for (auto {'' if self._ti_is_bool else '&'}it : this->{self.field_name}) {{\n"
         o += f"  buffer.{self._ti.encode_func}({self.number}, it, true);\n"
-        o += f"}}"
+        o += "}"
         return o
 
     @property
-    def dump_content(self):
-        o = f'for (const auto {"" if self._ti_is_bool else "&"}it : this->{self.field_name}) {{\n'
+    def dump_content(self) -> str:
+        o = f"for (const auto {'' if self._ti_is_bool else '&'}it : this->{self.field_name}) {{\n"
         o += f'  out.append("  {self.name}: ");\n'
         o += indent(self._ti.dump("it")) + "\n"
-        o += f'  out.append("\\n");\n'
-        o += f"}}\n"
+        o += '  out.append("\\n");\n'
+        o += "}\n"
+        return o
+
+    def dump(self, _: str):
+        pass
+
+    def get_size_calculation(self, name: str, force: bool = False) -> str:
+        # For repeated fields, we always need to pass force=True to the underlying type's calculation
+        # This is because the encode method always sets force=true for repeated fields
+        if isinstance(self._ti, MessageType):
+            # For repeated messages, use the dedicated helper that handles iteration internally
+            field_id_size = self._ti.calculate_field_id_size()
+            o = f"ProtoSize::add_repeated_message(total_size, {field_id_size}, {name});"
+            return o
+        # For other repeated types, use the underlying type's size calculation with force=True
+        o = f"if (!{name}.empty()) {{\n"
+        o += f"  for (const auto {'' if self._ti_is_bool else '&'}it : {name}) {{\n"
+        o += f"    {self._ti.get_size_calculation('it', True)}\n"
+        o += "  }\n"
+        o += "}"
         return o
 
 
-def build_enum_type(desc):
+def build_enum_type(desc) -> tuple[str, str]:
+    """Builds the enum type."""
     name = desc.name
     out = f"enum {name} : uint32_t {{\n"
     for v in desc.value:
         out += f"  {v.name} = {v.number},\n"
     out += "};\n"
 
-    cpp = f"#ifdef HAS_PROTO_MESSAGE_DUMP\n"
+    cpp = "#ifdef HAS_PROTO_MESSAGE_DUMP\n"
     cpp += f"template<> const char *proto_enum_to_string<enums::{name}>(enums::{name} value) {{\n"
-    cpp += f"  switch (value) {{\n"
+    cpp += "  switch (value) {\n"
     for v in desc.value:
         cpp += f"    case enums::{v.name}:\n"
         cpp += f'      return "{v.name}";\n'
-    cpp += f"    default:\n"
-    cpp += f'      return "UNKNOWN";\n'
-    cpp += f"  }}\n"
-    cpp += f"}}\n"
-    cpp += f"#endif\n"
+    cpp += "    default:\n"
+    cpp += '      return "UNKNOWN";\n'
+    cpp += "  }\n"
+    cpp += "}\n"
+    cpp += "#endif\n"
 
     return out, cpp
 
 
-def build_message_type(desc):
-    public_content = []
-    protected_content = []
-    decode_varint = []
-    decode_length = []
-    decode_32bit = []
-    decode_64bit = []
-    encode = []
-    dump = []
+def build_message_type(desc: descriptor.DescriptorProto) -> tuple[str, str]:
+    public_content: list[str] = []
+    protected_content: list[str] = []
+    decode_varint: list[str] = []
+    decode_length: list[str] = []
+    decode_32bit: list[str] = []
+    decode_64bit: list[str] = []
+    encode: list[str] = []
+    dump: list[str] = []
+    size_calc: list[str] = []
 
     for field in desc.field:
         if field.label == 3:
@@ -580,6 +781,7 @@ def build_message_type(desc):
         protected_content.extend(ti.protected_content)
         public_content.extend(ti.public_content)
         encode.append(ti.encode_content)
+        size_calc.append(ti.get_size_calculation(f"this->{ti.field_name}"))
 
         if ti.decode_varint_content:
             decode_varint.append(ti.decode_varint_content)
@@ -646,16 +848,35 @@ def build_message_type(desc):
     prot = "void encode(ProtoWriteBuffer buffer) const override;"
     public_content.append(prot)
 
+    # Add calculate_size method
+    o = f"void {desc.name}::calculate_size(uint32_t &total_size) const {{"
+
+    # Add a check for empty/default objects to short-circuit the calculation
+    # Only add this optimization if we have fields to check
+    if size_calc:
+        # For a single field, just inline it for simplicity
+        if len(size_calc) == 1 and len(size_calc[0]) + len(o) + 3 < 120:
+            o += f" {size_calc[0]} "
+        else:
+            # For multiple fields, add a short-circuit check
+            o += "\n"
+            # Performance optimization: add all the size calculations
+            o += indent("\n".join(size_calc)) + "\n"
+    o += "}\n"
+    cpp += o
+    prot = "void calculate_size(uint32_t &total_size) const override;"
+    public_content.append(prot)
+
     o = f"void {desc.name}::dump_to(std::string &out) const {{"
     if dump:
         if len(dump) == 1 and len(dump[0]) + len(o) + 3 < 120:
             o += f" {dump[0]} "
         else:
             o += "\n"
-            o += f"  __attribute__((unused)) char buffer[64];\n"
+            o += "  __attribute__((unused)) char buffer[64];\n"
             o += f'  out.append("{desc.name} {{\\n");\n'
             o += indent("\n".join(dump)) + "\n"
-            o += f'  out.append("}}");\n'
+            o += '  out.append("}");\n'
     else:
         o2 = f'out.append("{desc.name} {{}}");'
         if len(o) + len(o2) + 3 < 120:
@@ -664,9 +885,9 @@ def build_message_type(desc):
             o += "\n"
             o += f"  {o2}\n"
     o += "}\n"
-    cpp += f"#ifdef HAS_PROTO_MESSAGE_DUMP\n"
+    cpp += "#ifdef HAS_PROTO_MESSAGE_DUMP\n"
     cpp += o
-    cpp += f"#endif\n"
+    cpp += "#endif\n"
     prot = "#ifdef HAS_PROTO_MESSAGE_DUMP\n"
     prot += "void dump_to(std::string &out) const override;\n"
     prot += "#endif\n"
@@ -684,91 +905,39 @@ def build_message_type(desc):
     return out, cpp
 
 
-file = d.file[0]
-content = file_header
-content += """\
-#pragma once
-
-#include "proto.h"
-
-namespace esphome {
-namespace api {
-
-"""
-
-cpp = file_header
-cpp += """\
-#include "api_pb2.h"
-#include "esphome/core/log.h"
-
-#include <cinttypes>
-
-namespace esphome {
-namespace api {
-
-"""
-
-content += "namespace enums {\n\n"
-
-for enum in file.enum_type:
-    s, c = build_enum_type(enum)
-    content += s
-    cpp += c
-
-content += "\n}  // namespace enums\n\n"
-
-mt = file.message_type
-
-for m in mt:
-    s, c = build_message_type(m)
-    content += s
-    cpp += c
-
-content += """\
-
-}  // namespace api
-}  // namespace esphome
-"""
-cpp += """\
-
-}  // namespace api
-}  // namespace esphome
-"""
-
-with open(root / "api_pb2.h", "w") as f:
-    f.write(content)
-
-with open(root / "api_pb2.cpp", "w") as f:
-    f.write(cpp)
-
 SOURCE_BOTH = 0
 SOURCE_SERVER = 1
 SOURCE_CLIENT = 2
 
-RECEIVE_CASES = {}
+RECEIVE_CASES: dict[int, str] = {}
 
-class_name = "APIServerConnectionBase"
-
-ifdefs = {}
+ifdefs: dict[str, str] = {}
 
 
-def get_opt(desc, opt, default=None):
+def get_opt(
+    desc: descriptor.DescriptorProto,
+    opt: descriptor.MessageOptions,
+    default: Any = None,
+) -> Any:
+    """Get the option from the descriptor."""
     if not desc.options.HasExtension(opt):
         return default
     return desc.options.Extensions[opt]
 
 
-def build_service_message_type(mt):
+def build_service_message_type(
+    mt: descriptor.DescriptorProto,
+) -> tuple[str, str] | None:
+    """Builds the service message type."""
     snake = camel_to_snake(mt.name)
-    id_ = get_opt(mt, pb.id)
+    id_: int | None = get_opt(mt, pb.id)
     if id_ is None:
         return None
 
-    source = get_opt(mt, pb.source, 0)
+    source: int = get_opt(mt, pb.source, 0)
 
-    ifdef = get_opt(mt, pb.ifdef)
-    log = get_opt(mt, pb.log, True)
-    nodelay = get_opt(mt, pb.no_delay, False)
+    ifdef: str | None = get_opt(mt, pb.ifdef)
+    log: bool = get_opt(mt, pb.log, True)
     hout = ""
     cout = ""
 
@@ -781,14 +950,14 @@ def build_service_message_type(mt):
         # Generate send
         func = f"send_{snake}"
         hout += f"bool {func}(const {mt.name} &msg);\n"
-        cout += f"bool {class_name}::{func}(const {mt.name} &msg) {{\n"
+        cout += f"bool APIServerConnectionBase::{func}(const {mt.name} &msg) {{\n"
         if log:
-            cout += f"#ifdef HAS_PROTO_MESSAGE_DUMP\n"
+            cout += "#ifdef HAS_PROTO_MESSAGE_DUMP\n"
             cout += f'  ESP_LOGVV(TAG, "{func}: %s", msg.dump().c_str());\n'
-            cout += f"#endif\n"
+            cout += "#endif\n"
         # cout += f'  this->set_nodelay({str(nodelay).lower()});\n'
         cout += f"  return this->send_message_<{mt.name}>(msg, {id_});\n"
-        cout += f"}}\n"
+        cout += "}\n"
     if source in (SOURCE_BOTH, SOURCE_CLIENT):
         # Generate receive
         func = f"on_{snake}"
@@ -797,169 +966,245 @@ def build_service_message_type(mt):
         if ifdef is not None:
             case += f"#ifdef {ifdef}\n"
         case += f"{mt.name} msg;\n"
-        case += f"msg.decode(msg_data, msg_size);\n"
+        case += "msg.decode(msg_data, msg_size);\n"
         if log:
-            case += f"#ifdef HAS_PROTO_MESSAGE_DUMP\n"
+            case += "#ifdef HAS_PROTO_MESSAGE_DUMP\n"
             case += f'ESP_LOGVV(TAG, "{func}: %s", msg.dump().c_str());\n'
-            case += f"#endif\n"
+            case += "#endif\n"
         case += f"this->{func}(msg);\n"
         if ifdef is not None:
-            case += f"#endif\n"
+            case += "#endif\n"
         case += "break;"
         RECEIVE_CASES[id_] = case
 
     if ifdef is not None:
-        hout += f"#endif\n"
-        cout += f"#endif\n"
+        hout += "#endif\n"
+        cout += "#endif\n"
 
     return hout, cout
 
 
-hpp = file_header
-hpp += """\
-#pragma once
+def main() -> None:
+    """Main function to generate the C++ classes."""
+    cwd = Path(__file__).resolve().parent
+    root = cwd.parent.parent / "esphome" / "components" / "api"
+    prot_file = root / "api.protoc"
+    call(["protoc", "-o", str(prot_file), "-I", str(root), "api.proto"])
+    proto_content = prot_file.read_bytes()
 
-#include "api_pb2.h"
-#include "esphome/core/defines.h"
+    # pylint: disable-next=no-member
+    d = descriptor.FileDescriptorSet.FromString(proto_content)
 
-namespace esphome {
-namespace api {
+    file = d.file[0]
+    content = FILE_HEADER
+    content += """\
+    #pragma once
 
-"""
+    #include "proto.h"
+    #include "api_pb2_size.h"
 
-cpp = file_header
-cpp += """\
-#include "api_pb2_service.h"
-#include "esphome/core/log.h"
+    namespace esphome {
+    namespace api {
 
-namespace esphome {
-namespace api {
+    """
 
-static const char *const TAG = "api.service";
+    cpp = FILE_HEADER
+    cpp += """\
+    #include "api_pb2.h"
+    #include "api_pb2_size.h"
+    #include "esphome/core/log.h"
 
-"""
+    #include <cinttypes>
 
-hpp += f"class {class_name} : public ProtoService {{\n"
-hpp += " public:\n"
+    namespace esphome {
+    namespace api {
 
-for mt in file.message_type:
-    obj = build_service_message_type(mt)
-    if obj is None:
-        continue
-    hout, cout = obj
-    hpp += indent(hout) + "\n"
-    cpp += cout
+    """
 
-cases = list(RECEIVE_CASES.items())
-cases.sort()
-hpp += " protected:\n"
-hpp += f"  bool read_message(uint32_t msg_size, uint32_t msg_type, uint8_t *msg_data) override;\n"
-out = f"bool {class_name}::read_message(uint32_t msg_size, uint32_t msg_type, uint8_t *msg_data) {{\n"
-out += f"  switch (msg_type) {{\n"
-for i, case in cases:
-    c = f"case {i}: {{\n"
-    c += indent(case) + "\n"
-    c += f"}}"
-    out += indent(c, "    ") + "\n"
-out += "    default:\n"
-out += "      return false;\n"
-out += "  }\n"
-out += "  return true;\n"
-out += "}\n"
-cpp += out
-hpp += "};\n"
+    content += "namespace enums {\n\n"
 
-serv = file.service[0]
-class_name = "APIServerConnection"
-hpp += "\n"
-hpp += f"class {class_name} : public {class_name}Base {{\n"
-hpp += " public:\n"
-hpp_protected = ""
-cpp += "\n"
+    for enum in file.enum_type:
+        s, c = build_enum_type(enum)
+        content += s
+        cpp += c
 
-m = serv.method[0]
-for m in serv.method:
-    func = m.name
-    inp = m.input_type[1:]
-    ret = m.output_type[1:]
-    is_void = ret == "void"
-    snake = camel_to_snake(inp)
-    on_func = f"on_{snake}"
-    needs_conn = get_opt(m, pb.needs_setup_connection, True)
-    needs_auth = get_opt(m, pb.needs_authentication, True)
+    content += "\n}  // namespace enums\n\n"
 
-    ifdef = ifdefs.get(inp, None)
+    mt = file.message_type
 
-    if ifdef is not None:
-        hpp += f"#ifdef {ifdef}\n"
-        hpp_protected += f"#ifdef {ifdef}\n"
-        cpp += f"#ifdef {ifdef}\n"
+    for m in mt:
+        s, c = build_message_type(m)
+        content += s
+        cpp += c
 
-    hpp_protected += f"  void {on_func}(const {inp} &msg) override;\n"
-    hpp += f"  virtual {ret} {func}(const {inp} &msg) = 0;\n"
-    cpp += f"void {class_name}::{on_func}(const {inp} &msg) {{\n"
-    body = ""
-    if needs_conn:
-        body += "if (!this->is_connection_setup()) {\n"
-        body += "  this->on_no_setup_connection();\n"
-        body += "  return;\n"
-        body += "}\n"
-    if needs_auth:
-        body += "if (!this->is_authenticated()) {\n"
-        body += "  this->on_unauthenticated_access();\n"
-        body += "  return;\n"
-        body += "}\n"
+    content += """\
 
-    if is_void:
-        body += f"this->{func}(msg);\n"
-    else:
-        body += f"{ret} ret = this->{func}(msg);\n"
-        ret_snake = camel_to_snake(ret)
-        body += f"if (!this->send_{ret_snake}(ret)) {{\n"
-        body += f"  this->on_fatal_error();\n"
-        body += "}\n"
-    cpp += indent(body) + "\n" + "}\n"
+    }  // namespace api
+    }  // namespace esphome
+    """
+    cpp += """\
 
-    if ifdef is not None:
-        hpp += f"#endif\n"
-        hpp_protected += f"#endif\n"
-        cpp += f"#endif\n"
+    }  // namespace api
+    }  // namespace esphome
+    """
 
-hpp += " protected:\n"
-hpp += hpp_protected
-hpp += "};\n"
+    with open(root / "api_pb2.h", "w", encoding="utf-8") as f:
+        f.write(content)
 
-hpp += """\
+    with open(root / "api_pb2.cpp", "w", encoding="utf-8") as f:
+        f.write(cpp)
 
-}  // namespace api
-}  // namespace esphome
-"""
-cpp += """\
+    hpp = FILE_HEADER
+    hpp += """\
+    #pragma once
 
-}  // namespace api
-}  // namespace esphome
-"""
+    #include "api_pb2.h"
+    #include "esphome/core/defines.h"
 
-with open(root / "api_pb2_service.h", "w") as f:
-    f.write(hpp)
+    namespace esphome {
+    namespace api {
 
-with open(root / "api_pb2_service.cpp", "w") as f:
-    f.write(cpp)
+    """
 
-prot.unlink()
+    cpp = FILE_HEADER
+    cpp += """\
+    #include "api_pb2_service.h"
+    #include "esphome/core/log.h"
 
-try:
-    import clang_format
+    namespace esphome {
+    namespace api {
 
-    def exec_clang_format(path):
-        clang_format_path = os.path.join(
-            os.path.dirname(clang_format.__file__), "data", "bin", "clang-format"
-        )
-        call([clang_format_path, "-i", path])
+    static const char *const TAG = "api.service";
 
-    exec_clang_format(root / "api_pb2_service.h")
-    exec_clang_format(root / "api_pb2_service.cpp")
-    exec_clang_format(root / "api_pb2.h")
-    exec_clang_format(root / "api_pb2.cpp")
-except ImportError:
-    pass
+    """
+
+    class_name = "APIServerConnectionBase"
+
+    hpp += f"class {class_name} : public ProtoService {{\n"
+    hpp += " public:\n"
+
+    for mt in file.message_type:
+        obj = build_service_message_type(mt)
+        if obj is None:
+            continue
+        hout, cout = obj
+        hpp += indent(hout) + "\n"
+        cpp += cout
+
+    cases = list(RECEIVE_CASES.items())
+    cases.sort()
+    hpp += " protected:\n"
+    hpp += "  bool read_message(uint32_t msg_size, uint32_t msg_type, uint8_t *msg_data) override;\n"
+    out = f"bool {class_name}::read_message(uint32_t msg_size, uint32_t msg_type, uint8_t *msg_data) {{\n"
+    out += "  switch (msg_type) {\n"
+    for i, case in cases:
+        c = f"case {i}: {{\n"
+        c += indent(case) + "\n"
+        c += "}"
+        out += indent(c, "    ") + "\n"
+    out += "    default:\n"
+    out += "      return false;\n"
+    out += "  }\n"
+    out += "  return true;\n"
+    out += "}\n"
+    cpp += out
+    hpp += "};\n"
+
+    serv = file.service[0]
+    class_name = "APIServerConnection"
+    hpp += "\n"
+    hpp += f"class {class_name} : public {class_name}Base {{\n"
+    hpp += " public:\n"
+    hpp_protected = ""
+    cpp += "\n"
+
+    m = serv.method[0]
+    for m in serv.method:
+        func = m.name
+        inp = m.input_type[1:]
+        ret = m.output_type[1:]
+        is_void = ret == "void"
+        snake = camel_to_snake(inp)
+        on_func = f"on_{snake}"
+        needs_conn = get_opt(m, pb.needs_setup_connection, True)
+        needs_auth = get_opt(m, pb.needs_authentication, True)
+
+        ifdef = ifdefs.get(inp, None)
+
+        if ifdef is not None:
+            hpp += f"#ifdef {ifdef}\n"
+            hpp_protected += f"#ifdef {ifdef}\n"
+            cpp += f"#ifdef {ifdef}\n"
+
+        hpp_protected += f"  void {on_func}(const {inp} &msg) override;\n"
+        hpp += f"  virtual {ret} {func}(const {inp} &msg) = 0;\n"
+        cpp += f"void {class_name}::{on_func}(const {inp} &msg) {{\n"
+        body = ""
+        if needs_conn:
+            body += "if (!this->is_connection_setup()) {\n"
+            body += "  this->on_no_setup_connection();\n"
+            body += "  return;\n"
+            body += "}\n"
+        if needs_auth:
+            body += "if (!this->is_authenticated()) {\n"
+            body += "  this->on_unauthenticated_access();\n"
+            body += "  return;\n"
+            body += "}\n"
+
+        if is_void:
+            body += f"this->{func}(msg);\n"
+        else:
+            body += f"{ret} ret = this->{func}(msg);\n"
+            ret_snake = camel_to_snake(ret)
+            body += f"if (!this->send_{ret_snake}(ret)) {{\n"
+            body += "  this->on_fatal_error();\n"
+            body += "}\n"
+        cpp += indent(body) + "\n" + "}\n"
+
+        if ifdef is not None:
+            hpp += "#endif\n"
+            hpp_protected += "#endif\n"
+            cpp += "#endif\n"
+
+    hpp += " protected:\n"
+    hpp += hpp_protected
+    hpp += "};\n"
+
+    hpp += """\
+
+    }  // namespace api
+    }  // namespace esphome
+    """
+    cpp += """\
+
+    }  // namespace api
+    }  // namespace esphome
+    """
+
+    with open(root / "api_pb2_service.h", "w", encoding="utf-8") as f:
+        f.write(hpp)
+
+    with open(root / "api_pb2_service.cpp", "w", encoding="utf-8") as f:
+        f.write(cpp)
+
+    prot_file.unlink()
+
+    try:
+        import clang_format
+
+        def exec_clang_format(path: Path) -> None:
+            clang_format_path = os.path.join(
+                os.path.dirname(clang_format.__file__), "data", "bin", "clang-format"
+            )
+            call([clang_format_path, "-i", path])
+
+        exec_clang_format(root / "api_pb2_service.h")
+        exec_clang_format(root / "api_pb2_service.cpp")
+        exec_clang_format(root / "api_pb2.h")
+        exec_clang_format(root / "api_pb2.cpp")
+    except ImportError:
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

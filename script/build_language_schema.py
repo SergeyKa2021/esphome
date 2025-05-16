@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
+import argparse
+import glob
 import inspect
 import json
-import argparse
 import os
-import glob
 import re
+
 import voluptuous as vol
 
 # NOTE: Cannot import other esphome components globally as a modification in vol_schema
@@ -35,6 +37,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--output-path", default=".", help="Output path", type=os.path.abspath
 )
+parser.add_argument("--check", action="store_true", help="Check only for CI")
 
 args = parser.parse_args()
 
@@ -61,43 +64,56 @@ solve_registry = []
 
 
 def get_component_names():
+    # pylint: disable-next=redefined-outer-name,reimported
     from esphome.loader import CORE_COMPONENTS_PATH
 
     component_names = ["esphome", "sensor", "esp32", "esp8266"]
+    skip_components = []
 
     for d in os.listdir(CORE_COMPONENTS_PATH):
         if not d.startswith("__") and os.path.isdir(
             os.path.join(CORE_COMPONENTS_PATH, d)
         ):
-            if d not in component_names:
+            if d not in component_names and d not in skip_components:
                 component_names.append(d)
 
-    return component_names
+    return sorted(component_names)
 
 
 def load_components():
     from esphome.config import get_component
 
     for domain in get_component_names():
-        components[domain] = get_component(domain)
+        components[domain] = get_component(domain, exception=True)
+        assert components[domain] is not None
 
 
-from esphome.const import CONF_TYPE, KEY_CORE
-from esphome.core import CORE
+from esphome.const import (  # noqa: E402
+    CONF_TYPE,
+    KEY_CORE,
+    KEY_FRAMEWORK_VERSION,
+    KEY_TARGET_FRAMEWORK,
+    KEY_TARGET_PLATFORM,
+)
+from esphome.core import CORE  # noqa: E402
 
-CORE.data[KEY_CORE] = {}
+CORE.data[KEY_CORE] = {
+    KEY_TARGET_PLATFORM: "esp8266",
+    KEY_TARGET_FRAMEWORK: "arduino",
+    KEY_FRAMEWORK_VERSION: "0",
+}
+
+
 load_components()
 
 # Import esphome after loading components (so schema is tracked)
 # pylint: disable=wrong-import-position
-import esphome.core as esphome_core
-import esphome.config_validation as cv
-from esphome import automation
-from esphome import pins
-from esphome.components import remote_base
-from esphome.loader import get_platform, CORE_COMPONENTS_PATH
-from esphome.helpers import write_file_if_changed
-from esphome.util import Registry
+from esphome import automation, pins  # noqa: E402
+from esphome.components import remote_base  # noqa: E402
+import esphome.config_validation as cv  # noqa: E402
+from esphome.helpers import write_file_if_changed  # noqa: E402
+from esphome.loader import CORE_COMPONENTS_PATH, get_platform  # noqa: E402
+from esphome.util import Registry  # noqa: E402
 
 # pylint: enable=wrong-import-position
 
@@ -114,7 +130,7 @@ def write_file(name, obj):
 
 def delete_extra_files(keep_names):
     for d in os.listdir(args.output_path):
-        if d.endswith(".json") and not d[:-5] in keep_names:
+        if d.endswith(".json") and d[:-5] not in keep_names:
             os.remove(os.path.join(args.output_path, d))
             print(f"Deleted {d}")
 
@@ -390,9 +406,8 @@ def add_referenced_recursive(referenced_schemas, config_var, path, eat_schema=Fa
         for k in schema.get(S_EXTENDS, []):
             if k not in referenced_schemas:
                 referenced_schemas[k] = [path]
-            else:
-                if path not in referenced_schemas[k]:
-                    referenced_schemas[k].append(path)
+            elif path not in referenced_schemas[k]:
+                referenced_schemas[k].append(path)
 
             s1 = get_str_path_schema(k)
             p = k.split(".")
@@ -520,11 +535,14 @@ def shrink():
     # then are all simple types, integer and strings
     for x, paths in referenced_schemas.items():
         key_s = get_str_path_schema(x)
-        if key_s and key_s[S_TYPE] in ["enum", "registry", "integer", "string"]:
+        if key_s and key_s.get(S_TYPE) in ["enum", "registry", "integer", "string"]:
             if key_s[S_TYPE] == "registry":
                 print("Spreading registry: " + x)
             for target in paths:
                 target_s = get_arr_path_schema(target)
+                if S_SCHEMA not in target_s:
+                    print("skipping simple spread for " + ".".join(target))
+                    continue
                 assert target_s[S_SCHEMA][S_EXTENDS] == [x]
                 target_s.pop(S_SCHEMA)
                 target_s |= key_s
@@ -539,24 +557,23 @@ def shrink():
                     # an empty schema like speaker.SPEAKER_SCHEMA
                     target_s[S_EXTENDS].remove(x)
                     continue
-                assert target_s[S_SCHEMA][S_EXTENDS] == [x]
+                assert x in target_s[S_SCHEMA][S_EXTENDS]
                 target_s.pop(S_SCHEMA)
                 target_s.pop(S_TYPE)  # undefined
                 target_s["data_type"] = x.split(".")[1]
             # remove this dangling again
             pop_str_path_schema(x)
 
-    # remove dangling items (unreachable schemas)
+    # remove unreachable schemas
     for domain, domain_schemas in output.items():
         for schema_name in list(domain_schemas.get(S_SCHEMAS, {}).keys()):
             s = f"{domain}.{schema_name}"
             if (
                 not s.endswith("." + S_CONFIG_SCHEMA)
-                and s not in referenced_schemas.keys()
+                and s not in referenced_schemas
                 and not is_platform_schema(s)
             ):
-                print(f"Removing {s}")
-                output[domain][S_SCHEMAS].pop(schema_name)
+                domain_schemas[S_SCHEMAS].pop(schema_name)
 
 
 def build_schema():
@@ -564,7 +581,7 @@ def build_schema():
 
     # check esphome was not loaded globally (IDE auto imports)
     if len(ejs.extended_schemas) == 0:
-        raise Exception(
+        raise LookupError(
             "no data collected. Did you globally import an ESPHome component?"
         )
 
@@ -611,9 +628,9 @@ def build_schema():
             if platform_manifest is not None:
                 output[platform][S_COMPONENTS][domain] = {}
                 if len(platform_manifest.dependencies) > 0:
-                    output[platform][S_COMPONENTS][domain][
-                        "dependencies"
-                    ] = platform_manifest.dependencies
+                    output[platform][S_COMPONENTS][domain]["dependencies"] = (
+                        platform_manifest.dependencies
+                    )
                 register_module_schemas(
                     f"{domain}.{platform}", platform_manifest.module, platform_manifest
                 )
@@ -655,6 +672,9 @@ def build_schema():
 
     # bundle core inside esphome
     data["esphome"]["core"] = data.pop("core")["core"]
+
+    if args.check:  # do not gen files
+        return
 
     for c, s in data.items():
         write_file(c, s)
@@ -703,7 +723,7 @@ def convert(schema, config_var, path):
             if schema_instance is schema:
                 assert S_CONFIG_VARS not in config_var
                 assert S_EXTENDS not in config_var
-                if not S_TYPE in config_var:
+                if S_TYPE not in config_var:
                     config_var[S_TYPE] = S_SCHEMA
                 # assert config_var[S_TYPE] == S_SCHEMA
 
@@ -718,15 +738,8 @@ def convert(schema, config_var, path):
     # Extended schemas are tracked when the .extend() is used in a schema
     if repr_schema in ejs.extended_schemas:
         extended = ejs.extended_schemas.get(repr_schema)
-        # The midea actions are extending an empty schema (resulted in the templatize not templatizing anything)
-        # this causes a recursion in that this extended looks the same in extended schema as the extended[1]
-        if repr_schema == repr(extended[1]):
-            assert path.startswith("midea_ac/")
-            return
-
-        assert len(extended) == 2
-        convert(extended[0], config_var, path + "/extL")
-        convert(extended[1], config_var, path + "/extR")
+        for idx, ext in enumerate(extended):
+            convert(ext, config_var, f"{path}/ext{idx}")
         return
 
     if isinstance(schema, cv.All):
@@ -765,9 +778,9 @@ def convert(schema, config_var, path):
     elif schema == automation.validate_potentially_and_condition:
         config_var[S_TYPE] = "registry"
         config_var["registry"] = "condition"
-    elif schema == cv.int_ or schema == cv.int_range:
+    elif schema in (cv.int_, cv.int_range):
         config_var[S_TYPE] = "integer"
-    elif schema == cv.string or schema == cv.string_strict or schema == cv.valid_name:
+    elif schema in (cv.string, cv.string_strict, cv.valid_name):
         config_var[S_TYPE] = "string"
 
     elif isinstance(schema, vol.Schema):
@@ -779,6 +792,7 @@ def convert(schema, config_var, path):
         config_var |= pin_validators[repr_schema]
         config_var[S_TYPE] = "pin"
 
+    # pylint: disable-next=too-many-nested-blocks
     elif repr_schema in ejs.hidden_schemas:
         schema_type = ejs.hidden_schemas[repr_schema]
 
@@ -844,9 +858,11 @@ def convert(schema, config_var, path):
 
             config_var["id_type"] = {
                 "class": str(data.base),
-                "parents": [str(x.base) for x in parents]
-                if isinstance(parents, list)
-                else None,
+                "parents": (
+                    [str(x.base) for x in parents]
+                    if isinstance(parents, list)
+                    else None
+                ),
             }
         elif schema_type == "use_id":
             if inspect.ismodule(data):
@@ -861,30 +877,36 @@ def convert(schema, config_var, path):
                     config_var[S_TYPE] = "use_id"
                 else:
                     print("TODO deferred?")
+            elif isinstance(data, str):
+                # TODO: Figure out why pipsolar does this
+                config_var["use_id_type"] = data
             else:
-                if isinstance(data, str):
-                    # TODO: Figure out why pipsolar does this
-                    config_var["use_id_type"] = data
-                else:
-                    config_var["use_id_type"] = str(data.base)
-                    config_var[S_TYPE] = "use_id"
+                config_var["use_id_type"] = str(data.base)
+                config_var[S_TYPE] = "use_id"
         else:
-            raise Exception("Unknown extracted schema type")
+            raise TypeError("Unknown extracted schema type")
     elif config_var.get("key") == "GeneratedID":
         if path.startswith("i2c/CONFIG_SCHEMA/") and path.endswith("/id"):
             config_var["id_type"] = {
                 "class": "i2c::I2CBus",
                 "parents": ["Component"],
             }
-        elif path == "uart/CONFIG_SCHEMA/val 1/extL/all/id":
+        elif path == "uart/CONFIG_SCHEMA/val 1/ext0/all/id":
             config_var["id_type"] = {
                 "class": "uart::UARTComponent",
+                "parents": ["Component"],
+            }
+        elif path == "http_request/CONFIG_SCHEMA/val 1/ext0/all/id":
+            config_var["id_type"] = {
+                "class": "http_request::HttpRequestComponent",
                 "parents": ["Component"],
             }
         elif path == "pins/esp32/val 1/id":
             config_var["id_type"] = "pin"
         else:
-            raise Exception("Cannot determine id_type for " + path)
+            print("Cannot determine id_type for " + path)
+
+            # raise TypeError("Cannot determine id_type for " + path)
 
     elif repr_schema in ejs.registry_schemas:
         solve_registry.append((ejs.registry_schemas[repr_schema], config_var))
@@ -948,11 +970,7 @@ def convert_keys(converted, schema, path):
             result["key"] = "GeneratedID"
         elif isinstance(k, cv.Required):
             result["key"] = "Required"
-        elif (
-            isinstance(k, cv.Optional)
-            or isinstance(k, cv.Inclusive)
-            or isinstance(k, cv.Exclusive)
-        ):
+        elif isinstance(k, (cv.Optional, cv.Inclusive, cv.Exclusive)):
             result["key"] = "Optional"
         else:
             converted["key"] = "String"
@@ -964,9 +982,6 @@ def convert_keys(converted, schema, path):
             else:
                 converted["key_type"] = str(k)
 
-        esphome_core.CORE.data = {
-            esphome_core.KEY_CORE: {esphome_core.KEY_TARGET_PLATFORM: "esp8266"}
-        }
         if hasattr(k, "default") and str(k.default) != "...":
             default_value = k.default()
             if default_value is not None:

@@ -1,7 +1,6 @@
-import pytest
-
 from hypothesis import given
-from hypothesis.provisional import ip_addresses
+from hypothesis.strategies import ip_addresses
+import pytest
 
 from esphome import helpers
 
@@ -261,9 +260,20 @@ def test_snake_case(text, expected):
         ('!"§$%&/()=?foo_bar', "___________foo_bar"),
         ('foo_!"§$%&/()=?bar', "foo____________bar"),
         ('foo_bar!"§$%&/()=?', "foo_bar___________"),
+        ('foo-bar!"§$%&/()=?', "foo-bar___________"),
     ),
 )
 def test_sanitize(text, expected):
     actual = helpers.sanitize(text)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    ((["127.0.0.1", "fe80::1", "2001::2"], ["2001::2", "127.0.0.1", "fe80::1"]),),
+)
+def test_sort_ip_addresses(text: list[str], expected: list[str]) -> None:
+    actual = helpers.sort_ip_addresses(text)
 
     assert actual == expected

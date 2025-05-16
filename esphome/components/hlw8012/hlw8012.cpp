@@ -69,7 +69,7 @@ void HLW8012Component::update() {
 
   float power = cf_hz * this->power_multiplier_;
 
-  if (this->change_mode_at_ != 0) {
+  if (this->change_mode_at_ != 0 || this->change_mode_every_ == 0) {
     // Only read cf1 after one cycle. Apparently it's quite unstable after being changed.
     if (this->current_mode_) {
       float current = cf1_hz * this->current_multiplier_;
@@ -96,7 +96,7 @@ void HLW8012Component::update() {
     this->energy_sensor_->publish_state(energy);
   }
 
-  if (this->change_mode_at_++ == this->change_mode_every_) {
+  if (this->change_mode_every_ != 0 && this->change_mode_at_++ == this->change_mode_every_) {
     this->current_mode_ = !this->current_mode_;
     ESP_LOGV(TAG, "Changing mode to %s mode", this->current_mode_ ? "CURRENT" : "VOLTAGE");
     this->change_mode_at_ = 0;
